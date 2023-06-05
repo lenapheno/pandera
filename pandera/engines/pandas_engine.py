@@ -11,6 +11,7 @@ import dataclasses
 import datetime
 import decimal
 import inspect
+import sys
 import warnings
 from typing import (
     Any,
@@ -18,6 +19,7 @@ from typing import (
     Dict,
     Iterable,
     List,
+    NamedTuple,
     Optional,
     Type,
     Union,
@@ -41,7 +43,7 @@ from pandera.engines.type_aliases import (
 from pandera.engines.utils import pandas_version
 
 try:
-    import pyarrow  # pylint:disable=unused-import
+    import pyarrow  # pylint: disable=unused-import
 
     PYARROW_INSTALLED = True
 except ImportError:
@@ -51,10 +53,18 @@ except ImportError:
 PANDAS_1_2_0_PLUS = pandas_version().release >= (1, 2, 0)
 PANDAS_1_3_0_PLUS = pandas_version().release >= (1, 3, 0)
 
+
+# register different TypedDict type depending on python version
+if sys.version_info >= (3, 9):
+    from typing import TypedDict
+else:
+    from typing_extensions import TypedDict  # noqa
+
+
 try:
-    from typing import Literal, TypedDict, NamedTuple  # type: ignore
+    from typing import Literal  # type: ignore
 except ImportError:
-    from typing_extensions import Literal, TypedDict, NamedTuple  # type: ignore
+    from typing_extensions import Literal  # type: ignore
 
 
 def is_extension_dtype(
@@ -825,29 +835,31 @@ class DateTime(_BaseDateTime, dtypes.Timestamp):
 
         def _to_datetime(col: PandasObject) -> PandasObject:
             col = to_datetime_fn(col, **self.to_datetime_kwargs)
-            if hasattr(pandas_dtype, "tz") and pandas_dtype.tz is not None:
+            pdtype_tz = getattr(pandas_dtype, "tz", None)
+            coltype_tz = getattr(col.dtype, "tz", None)
+            if pdtype_tz is not None or coltype_tz is not None:
                 if hasattr(col, "dt"):
                     if col.dt.tz is None:
                         # localize datetime column so that it's timezone-aware
                         col = col.dt.tz_localize(
-                            pandas_dtype.tz,
+                            pdtype_tz,
                             **_tz_localize_kwargs,
                         )
                     else:
-                        col = col.dt.tz_convert(pandas_dtype.tz)
+                        col = col.dt.tz_convert(pdtype_tz)
                 elif (
                     hasattr(col, "tz")
-                    and col.tz != pandas_dtype.tz
+                    and col.tz != pdtype_tz
                     and hasattr(col, "tz_localize")
                 ):
                     if col.tz is None:
                         # localize datetime index so that it's timezone-aware
                         col = col.tz_localize(
-                            pandas_dtype.tz,
+                            pdtype_tz,
                             **_tz_localize_kwargs,
                         )
                     else:
-                        col = col.tz_convert(pandas_dtype.tz)
+                        col = col.tz_convert(pdtype_tz)
             return col.astype(pandas_dtype)
 
         if isinstance(data_container, pd.DataFrame):

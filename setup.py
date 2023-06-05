@@ -50,7 +50,7 @@ setup(
         "packaging >= 20.0",
         "pandas >= 1.2.0",
         "pydantic",
-        "typeguard",
+        "typeguard >= 3.0.2",
         "typing_extensions >= 3.7.4.3 ; python_version<'3.8'",
         "typing_inspect >= 0.6.0",
         "wrapt",
@@ -69,6 +69,7 @@ setup(
         "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
         "Topic :: Scientific/Engineering",
     ],
 )

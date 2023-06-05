@@ -198,12 +198,7 @@ def register_check_strategy(strategy_fn: StrategyFn):
                     f"specify the statistics for the {class_method.__name__} "
                     "method."
                 )
-            strategy_kwargs = {
-                arg: stat
-                for arg, stat in check.statistics.items()
-                if stat is not None
-            }
-            check.strategy = partial(strategy_fn, **strategy_kwargs)
+            check.strategy = strategy_fn
             return check
 
         return _wrapper
@@ -243,6 +238,34 @@ def _datetime_strategy(
             else st.sampled_from(npst.TIME_RESOLUTIONS)
         )
         return st.builds(dtype.type, strategy, res)
+
+
+def convert_dtype(array: Union[pd.Series, pd.Index], col_dtype: Any):
+    """Convert datatypes of an array (series or index)."""
+    if str(col_dtype).startswith("datetime64"):
+        try:
+            return array.astype(col_dtype)
+        except TypeError:
+            tz = getattr(col_dtype, "tz", None)
+            if tz is None:
+                tz_match = re.match(r"datetime64\[ns, (.+)\]", str(col_dtype))
+                tz = None if not tz_match else tz_match.group(1)
+
+            if isinstance(array, pd.Index):
+                return array.tz_localize(tz)  # type: ignore [attr-defined]
+            return array.dt.tz_localize(tz)  # type: ignore [union-attr]
+    return array.astype(col_dtype)
+
+
+def convert_dtypes(df: pd.DataFrame, col_dtypes: Dict[str, Any]):
+    """Convert datatypes of a dataframe."""
+    if df.empty:
+        return df
+
+    for col_name, col_dtype in col_dtypes.items():
+        df[col_name] = convert_dtype(df[col_name], col_dtype)
+
+    return df
 
 
 def numpy_time_dtypes(
@@ -776,7 +799,11 @@ def field_element_strategy(
         ).filter(check._check_fn)
 
     for check in checks:
-        check_strategy = STRATEGY_DISPATCHER.get((check.name, pd.Series), None)
+        check_strategy = (
+            check.strategy
+            if check.strategy is not None
+            else STRATEGY_DISPATCHER.get((check.name, pd.Series), None)
+        )
         if check_strategy is not None:
             elements = check_strategy(
                 pandera_dtype, elements, **check.statistics
@@ -787,12 +814,6 @@ def field_element_strategy(
         # by the series/dataframe strategy.
     if elements is None:
         elements = pandas_dtype_strategy(pandera_dtype)
-
-    # Hypothesis only supports pure numpy datetime64 (i.e. timezone naive).
-    # We cast to datetime64 after applying the check strategy so that checks
-    # can see timezone-aware values.
-    if _is_datetime_tz(pandera_dtype):
-        elements = _timestamp_to_datetime64_strategy(elements)
 
     return elements
 
@@ -806,7 +827,7 @@ def series_strategy(
     unique: bool = False,
     name: Optional[str] = None,
     size: Optional[int] = None,
-):
+) -> SearchStrategy[pd.Series]:
     """Strategy to generate a pandas Series.
 
     :param pandera_dtype: :class:`pandera.dtypes.DataType` instance.
@@ -821,10 +842,19 @@ def series_strategy(
     :returns: ``hypothesis`` strategy.
     """
     elements = field_element_strategy(pandera_dtype, strategy, checks=checks)
+
+    dtype = (
+        None
+        # let hypothesis use the elements strategy to build datatime-aware
+        # series
+        if _is_datetime_tz(pandera_dtype)
+        else to_numpy_dtype(pandera_dtype)
+    )
+
     strategy = (
         pdst.series(
             elements=elements,
-            dtype=to_numpy_dtype(pandera_dtype),
+            dtype=dtype,
             index=pdst.range_indexes(
                 min_size=0 if size is None else size, max_size=size
             ),
@@ -832,7 +862,7 @@ def series_strategy(
         )
         .filter(lambda x: x.shape[0] > 0)
         .map(lambda x: x.rename(name))
-        .map(lambda x: x.astype(pandera_dtype.type))
+        .map(partial(convert_dtype, col_dtype=pandera_dtype.type))
     )
     if nullable:
         strategy = null_field_masks(strategy)
@@ -840,7 +870,7 @@ def series_strategy(
     def undefined_check_strategy(strategy, check):
         """Strategy for checks with undefined strategies."""
         warnings.warn(
-            "Vectorized check doesn't have a defined strategy."
+            "Vectorized check doesn't have a defined strategy. "
             "Falling back to filtering drawn values based on the check "
             "definition. This can considerably slow down data-generation."
         )
@@ -851,8 +881,13 @@ def series_strategy(
         return strategy.filter(_check_fn)
 
     for check in checks if checks is not None else []:
-        check_strategy = STRATEGY_DISPATCHER.get((check.name, pd.Series), None)
-        if check_strategy is None and not check.element_wise:
+        # for checks with undefined built-in or custom strategies that are
+        # vectorized, apply check function to the entire series.
+        if (
+            check.strategy is None
+            and not STRATEGY_DISPATCHER.get((check.name, pd.Series))
+            and not check.element_wise
+        ):
             strategy = undefined_check_strategy(strategy, check)
 
     return strategy
@@ -920,7 +955,7 @@ def index_strategy(
         min_size=0 if size is None else size,
         max_size=size,
         unique=bool(unique),
-    ).map(lambda x: x.astype(pandera_dtype.type))
+    ).map(partial(convert_dtype, col_dtype=pandera_dtype.type))
 
     # this is a hack to convert np.str_ data values into native python str.
     col_dtype = str(pandera_dtype)
@@ -1009,11 +1044,14 @@ def dataframe_strategy(
     def make_row_strategy(col, checks):
         strategy = None
         for check in checks:
-            check_strategy = STRATEGY_DISPATCHER.get(
-                (check.name, pd.DataFrame), None
-            )
-            if check_strategy is not None:
-                strategy = check_strategy(
+            if check.strategy is not None:
+                strategy = check.strategy(
+                    col.dtype,
+                    strategy,
+                    **check.statistics,
+                )
+            elif STRATEGY_DISPATCHER.get((check.name, pd.DataFrame), None):
+                strategy = STRATEGY_DISPATCHER.get((check.name, pd.DataFrame))(
                     col.dtype, strategy, **check.statistics
                 )
             else:
@@ -1034,10 +1072,11 @@ def dataframe_strategy(
         row_strategy_checks = []
         undefined_strat_df_checks = []
         for check in checks:
-            check_strategy = STRATEGY_DISPATCHER.get(
-                (check.name, pd.DataFrame)
-            )
-            if check_strategy is not None or check.element_wise:
+            if (
+                check.strategy
+                or STRATEGY_DISPATCHER.get((check.name, pd.DataFrame), None)
+                or check.element_wise
+            ):
                 # we can apply element-wise checks defined at the dataframe
                 # level to the row strategy
                 row_strategy_checks.append(check)
@@ -1135,9 +1174,7 @@ def dataframe_strategy(
                 )
             )
 
-        strategy = strategy.map(
-            lambda df: df if df.empty else df.astype(col_dtypes)
-        )
+        strategy = strategy.map(partial(convert_dtypes, col_dtypes=col_dtypes))
 
         if size is not None and size > 0 and any(nullable_columns.values()):
             strategy = null_dataframe_masks(strategy, nullable_columns)
